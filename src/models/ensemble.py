@@ -289,3 +289,78 @@ class RewardModelEnsemble:
         checkpoint = torch.load(path, map_location=self.device)
         for model, state_dict in zip(self.models, checkpoint['models']):
             model.load_state_dict(state_dict)
+
+    def precompute_rewards(self, mdp, verbose: bool = True) -> dict:
+        """
+        Precompute mean rewards for all state-action-next_state transitions.
+
+        This creates a lookup table of rewards that can be used for much faster
+        evaluation, avoiding the need to run forward passes through the ensemble
+        on every reward lookup during value iteration.
+
+        Args:
+            mdp: The MDP environment with defined state space.
+            verbose: If True, print progress information.
+
+        Returns:
+            Dictionary mapping (state, action, next_state) to mean reward.
+        """
+        if verbose:
+            print("Precomputing rewards for all transitions...")
+
+        precomputed_rewards = {}
+
+        # Get all states - works for gridworlds with size or grid_size attribute
+        if hasattr(mdp, 'size'):
+            size = mdp.size
+            all_states = [(x, y) for x in range(size) for y in range(size)]
+        elif hasattr(mdp, 'grid_size'):
+            size = mdp.grid_size
+            all_states = [(x, y) for x in range(size) for y in range(size)]
+        else:
+            raise ValueError("MDP must have a 'size' or 'grid_size' attribute to precompute rewards")
+
+        num_states = len(all_states)
+        num_actions = mdp.get_num_actions()
+        total_transitions = num_states * num_actions
+
+        for idx, state in enumerate(all_states):
+            for action in range(num_actions):
+                # Take action in environment
+                next_state, _, _ = mdp.step(state, action)
+
+                # Get mean reward from ensemble
+                # Convert state to one-hot encoding
+                state_row, state_col = state
+                state_onehot = np.zeros(self.state_dim)
+                state_onehot[state_row * int(np.sqrt(self.state_dim)) + state_col] = 1.0
+
+                next_state_row, next_state_col = next_state
+                next_state_onehot = np.zeros(self.state_dim)
+                next_state_onehot[next_state_row * int(np.sqrt(self.state_dim)) + next_state_col] = 1.0
+
+                # Convert to tensors
+                state_tensor = torch.FloatTensor(state_onehot).unsqueeze(0).to(self.device)
+                next_state_tensor = torch.FloatTensor(next_state_onehot).unsqueeze(0).to(self.device)
+                action_tensor = torch.LongTensor([action]).to(self.device)
+
+                # Get predictions from each model in ensemble
+                predictions = []
+                for model in self.models:
+                    model.eval()
+                    with torch.no_grad():
+                        reward_pred = model(state_tensor, action_tensor, next_state_tensor)
+                        predictions.append(reward_pred.item())
+
+                # Store mean reward
+                mean_reward = np.mean(predictions)
+                precomputed_rewards[(state, action, next_state)] = mean_reward
+
+            if verbose and (idx + 1) % max(1, num_states // 10) == 0:
+                progress = (idx + 1) * num_actions / total_transitions * 100
+                print(f"  Progress: {progress:.1f}% ({(idx + 1) * num_actions}/{total_transitions} transitions)")
+
+        if verbose:
+            print(f"  Precomputed {len(precomputed_rewards)} transitions!")
+
+        return precomputed_rewards

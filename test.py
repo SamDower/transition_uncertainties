@@ -6,6 +6,7 @@ from src.environments import GridWorldMDP, SparseSummitMDP
 from src.policies import UniformPolicy, CustomPolicy
 from src.utils import sample_trajectory_pairs, label_trajectory_pairs, get_trajectory_statistics
 from src.models import RewardModelEnsemble
+from src.utils.plotting import plot_ensemble_gridworld_deterministic
 import random
 
 
@@ -30,51 +31,79 @@ def main():
     # print(f"   - Goal state: {env.goal_state}")
 
     # Step 2: Create policy
-    print("\n2. Creating policy...")
-    policy = CustomPolicy(lambda s: [0.2, 0.3, 0.2, 0.3])
-    print("   - Using uniform random policy")
+    # print("\n2. Creating policy...")
+    # policy = CustomPolicy(lambda s: [0.2, 0.3, 0.2, 0.3])
+    # print("   - Using uniform random policy")
 
-    # Step 3: Sample trajectory pairs
-    print("\n3. Sampling trajectory pairs...")
-    num_pairs = 1000
-    max_steps = 20
-    pairs = sample_trajectory_pairs(
-        mdp=env,
-        policy=policy,
-        num_pairs=num_pairs,
-        max_steps=max_steps,
-        seed=42
-    )
-    print(f"   - Sampled {num_pairs} trajectory pairs")
-    print(f"   - Max steps per trajectory: {max_steps}")
+    # # Step 3: Sample trajectory pairs
+    # print("\n3. Sampling trajectory pairs...")
+    # num_pairs = 1000
+    # max_steps = 20
+    # pairs = sample_trajectory_pairs(
+    #     mdp=env,
+    #     policy=policy,
+    #     num_pairs=num_pairs,
+    #     max_steps=max_steps,
+    #     seed=42
+    # )
+    # print(f"   - Sampled {num_pairs} trajectory pairs")
+    # print(f"   - Max steps per trajectory: {max_steps}")
 
-    # Get statistics
-    all_trajectories = []
-    for traj1, traj2 in pairs:
-        all_trajectories.extend([traj1, traj2])
+    # # Get statistics
+    # all_trajectories = []
+    # for traj1, traj2 in pairs:
+    #     all_trajectories.extend([traj1, traj2])
 
-    stats = get_trajectory_statistics(all_trajectories)
-    print(f"\n   Trajectory Statistics:")
-    print(f"   - Mean length: {stats['mean_length']:.2f} ± {stats['std_length']:.2f}")
-    print(f"   - Mean return: {stats['mean_return']:.3f} ± {stats['std_return']:.3f}")
-    print(f"   - Return range: [{stats['min_return']:.3f}, {stats['max_return']:.3f}]")
+    # stats = get_trajectory_statistics(all_trajectories)
+    # print(f"\n   Trajectory Statistics:")
+    # print(f"   - Mean length: {stats['mean_length']:.2f} ± {stats['std_length']:.2f}")
+    # print(f"   - Mean return: {stats['mean_return']:.3f} ± {stats['std_return']:.3f}")
+    # print(f"   - Return range: [{stats['min_return']:.3f}, {stats['max_return']:.3f}]")
 
 
-    frequencies = np.zeros((64, env.get_num_actions()))
-    for traj1, traj2 in pairs:
-        for transition in traj1.transitions:
-            frequencies[env.state_to_index(transition.state), transition.action] += 1
-        for transition in traj2.transitions:
-            frequencies[env.state_to_index(transition.state), transition.action] += 1
+    # frequencies = np.zeros((64, env.get_num_actions()))
+    # for traj1, traj2 in pairs:
+    #     for transition in traj1.transitions:
+    #         frequencies[env.state_to_index(transition.state), transition.action] += 1
+    #     for transition in traj2.transitions:
+    #         frequencies[env.state_to_index(transition.state), transition.action] += 1
     
-    print("--------------------------------------------")
-    print(frequencies[:,0].reshape(8, 8).astype(int))
-    print("--------------------------------------------")
-    print(frequencies[:,1].reshape(8, 8).astype(int))
-    print("--------------------------------------------")
-    print(frequencies[:,2].reshape(8, 8).astype(int))
-    print("--------------------------------------------")
-    print(frequencies[:,3].reshape(8, 8).astype(int))
+    # print("--------------------------------------------")
+    # print(frequencies[:,0].reshape(8, 8).astype(int))
+    # print("--------------------------------------------")
+    # print(frequencies[:,1].reshape(8, 8).astype(int))
+    # print("--------------------------------------------")
+    # print(frequencies[:,2].reshape(8, 8).astype(int))
+    # print("--------------------------------------------")
+    # print(frequencies[:,3].reshape(8, 8).astype(int))
+
+    # Step 2: Load the reward ensemble
+    print("\n2. Loading trained reward ensemble...")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"   - Device: {device}")
+
+    # Initialize ensemble with same architecture as training
+    ensemble_size = 5
+    state_dim = grid_size * grid_size
+    num_actions = env.get_num_actions()
+
+    ensemble = RewardModelEnsemble(
+        ensemble_size=ensemble_size,
+        state_dim=state_dim,
+        num_actions=num_actions,
+        hidden_dims=[64, 64],
+        lr=1e-3,
+        max_steps=20,
+        device=device,
+    )
+
+    # Load trained weights
+    ensemble.load('reward_ensemble.pt')
+    print(f"   - Ensemble loaded successfully")
+    print(f"   - Ensemble size: {ensemble_size}")
+    print(f"   - State dimension: {state_dim}")
+
+    plot_ensemble_gridworld_deterministic(env, ensemble)
 
 #     # Step 2: Create policy
 #     print("\n2. Creating policy...")
