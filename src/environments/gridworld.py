@@ -5,7 +5,7 @@ from typing import Tuple
 from .mdp import MDP
 
 
-class GridWorld(MDP):
+class GridWorldMDP(MDP):
     """
     A simple gridworld environment.
 

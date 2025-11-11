@@ -2,10 +2,11 @@
 
 import numpy as np
 import torch
-from src.environments import GridWorld
-from src.policies import UniformPolicy
+from src.environments import GridWorldMDP, SparseSummitMDP
+from src.policies import UniformPolicy, CustomPolicy
 from src.utils import sample_trajectory_pairs, label_trajectory_pairs, get_trajectory_statistics
 from src.models import RewardModelEnsemble
+import random
 
 
 def main():
@@ -18,22 +19,23 @@ def main():
     np.random.seed(42)
 
     # Step 1: Create GridWorld MDP
-    print("\n1. Creating GridWorld MDP...")
-    grid_size = 5
-    env = GridWorld(grid_size=grid_size, seed=42)
-    print(f"   - Grid size: {grid_size}x{grid_size}")
-    print(f"   - Number of states: {env.get_num_states()}")
-    print(f"   - Number of actions: {env.get_num_actions()}")
-    print(f"   - Goal state: {env.goal_state}")
+    print("\n1. Creating SparseSummit MDP...")
+    #env = GridWorld(grid_size=grid_size, seed=42)
+    grid_size = 8
+    env = SparseSummitMDP(discount_factor = 0.99, grid_size = grid_size, use_trap = True)
+    # print(f"   - Grid size: {grid_size}x{grid_size}")
+    # print(f"   - Number of states: {env.get_num_states()}")
+    # print(f"   - Number of actions: {env.get_num_actions()}")
+    # print(f"   - Goal state: {env.goal_state}")
 
     # Step 2: Create policy
     print("\n2. Creating policy...")
-    policy = UniformPolicy(num_actions=env.get_num_actions())
+    policy = CustomPolicy(lambda s: [0.2, 0.3, 0.2, 0.3])
     print("   - Using uniform random policy")
 
     # Step 3: Sample trajectory pairs
     print("\n3. Sampling trajectory pairs...")
-    num_pairs = 100
+    num_pairs = 1000
     max_steps = 20
     pairs = sample_trajectory_pairs(
         mdp=env,
@@ -77,7 +79,8 @@ def main():
         num_actions=num_actions,
         hidden_dims=[64, 64],
         lr=1e-3,
-        device=device
+        max_steps=max_steps,
+        device=device,
     )
     print(f"   - Ensemble size: {ensemble_size}")
     print(f"   - State dimension: {state_dim}")
@@ -88,7 +91,7 @@ def main():
     ensemble.train(
         trajectory_pairs=pairs,
         preferences=preferences,
-        num_epochs=50,
+        num_epochs=20,
         batch_size=10,
         bootstrap=True,
         verbose=True

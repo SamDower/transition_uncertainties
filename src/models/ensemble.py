@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 from typing import List, Tuple, Optional
-from .reward_model import TransitionRewardModel, trajectory_to_tensors
+from .reward_model import TransitionRewardModel, trajectory_to_tensors, preprocess_trajectory_pairs
 
 
 class RewardModelEnsemble:
@@ -19,6 +19,7 @@ class RewardModelEnsemble:
         hidden_dims: list = [64, 64],
         activation: str = 'relu',
         lr: float = 1e-3,
+        max_steps: int = 20,
         device: str = 'cpu'
     ):
         """
@@ -36,6 +37,7 @@ class RewardModelEnsemble:
         self.ensemble_size = ensemble_size
         self.state_dim = state_dim
         self.num_actions = num_actions
+        self.max_steps = max_steps
         self.device = device
 
         # Create ensemble of models
@@ -57,9 +59,9 @@ class RewardModelEnsemble:
 
     def train_step(
         self,
-        trajectory_pairs: List[Tuple],
+        trajectory_pairs_tensors: List[Tuple],
         preferences: np.ndarray,
-        batch_indices: Optional[np.ndarray] = None
+        batch_indices_per_model: Optional[np.ndarray] = None
     ) -> List[float]:
         """
         Perform one training step on the ensemble.
@@ -67,71 +69,114 @@ class RewardModelEnsemble:
         Args:
             trajectory_pairs: List of (trajectory1, trajectory2) tuples.
             preferences: Array of preference labels (0 or 1).
-            batch_indices: Optional indices to use for this batch.
+            batch_indices_per_model: Optional indices to use for this batch.
 
         Returns:
             List of losses for each model.
         """
-        if batch_indices is None:
-            batch_indices = np.arange(len(trajectory_pairs))
+        if batch_indices_per_model is None:
+            batch_indices_per_model = [np.arange(len(trajectory_pairs_tensors)) for _ in range(self.ensemble_size)]
 
         losses = []
 
+        discount_factor = 0.99
+        self.discount_cache = {
+            L: (discount_factor ** torch.arange(L, device=self.device, dtype=torch.float32))
+            for L in range(1, self.max_steps + 1)
+        }
+
         for model_idx, (model, optimizer) in enumerate(zip(self.models, self.optimizers)):
-            # For ensemble diversity, each model can use a bootstrap sample
-            # For now, use the same data for all models
-            batch_loss = 0.0
-            num_pairs = len(batch_indices)
-
             optimizer.zero_grad()
+            model.train()
 
-            for idx in batch_indices:
-                traj1, traj2 = trajectory_pairs[idx]
+            batch_returns_1 = []
+            batch_returns_2 = []
+            batch_targets = []
+
+            # ---- compute discounted returns for all pairs ----
+            for idx in batch_indices_per_model[model_idx]:
+                traj1, traj2 = trajectory_pairs_tensors[idx]
                 preference = preferences[idx]
 
-                # Convert trajectories to tensors directly on device
-                states1, actions1, next_states1 = trajectory_to_tensors(traj1, self.state_dim, self.device)
-                states2, actions2, next_states2 = trajectory_to_tensors(traj2, self.state_dim, self.device)
+                states1, actions1, next_states1 = traj1
+                states2, actions2, next_states2 = traj2
 
-                # Compute predicted returns (with gradients enabled)
-                # Get rewards for all transitions
-                rewards1 = model.forward(states1, actions1, next_states1).squeeze(-1)
-                rewards2 = model.forward(states2, actions2, next_states2).squeeze(-1)
+                # Compute predicted transition rewards
+                rewards1 = model(states1, actions1, next_states1).squeeze(-1)
+                rewards2 = model(states2, actions2, next_states2).squeeze(-1)
+
+                # Apply precomputed discount vectors
+                discounts1 = self.discount_cache[len(rewards1)]
+                discounts2 = self.discount_cache[len(rewards2)]
 
                 # Compute discounted returns
-                discount_factor = 0.99
-                discounts1 = torch.tensor(
-                    [discount_factor ** i for i in range(len(rewards1))],
-                    dtype=torch.float32,
-                    device=self.device
-                )
-                discounts2 = torch.tensor(
-                    [discount_factor ** i for i in range(len(rewards2))],
-                    dtype=torch.float32,
-                    device=self.device
-                )
-
                 return1 = torch.sum(rewards1 * discounts1)
                 return2 = torch.sum(rewards2 * discounts2)
 
-                # Bradley-Terry preference model loss
-                # P(traj1 > traj2) = exp(return1) / (exp(return1) + exp(return2))
-                # If preference = 0, we want return1 > return2
-                # If preference = 1, we want return2 > return1
+                batch_returns_1.append(return1)
+                batch_returns_2.append(return2)
+                batch_targets.append(preference)
 
-                logits = torch.stack([return1, return2])
-                target = torch.tensor([preference], dtype=torch.long, device=self.device)
+            # ---- stack into batch tensors ----
+            logits = torch.stack([torch.stack(batch_returns_1),
+                                torch.stack(batch_returns_2)], dim=1)  # [batch_size, 2]
+            targets = torch.tensor(batch_targets, dtype=torch.long, device=self.device)
 
-                loss = nn.CrossEntropyLoss()(logits.unsqueeze(0), target)
-                batch_loss += loss.item()
+            # ---- compute batch loss once ----
+            loss_fn = nn.CrossEntropyLoss()
+            loss = loss_fn(logits, targets)
 
-                # Accumulate gradients
-                loss.backward()
-
-            # Update parameters after processing all pairs in batch
+            # ---- backward and optimize ----
+            loss.backward()
             optimizer.step()
 
-            losses.append(batch_loss / num_pairs)
+            losses.append(loss.item())
+
+        # for model_idx, (model, optimizer) in enumerate(zip(self.models, self.optimizers)):
+        #     # For ensemble diversity, each model can use a bootstrap sample
+        #     # For now, use the same data for all models
+        #     batch_loss = 0.0
+        #     num_pairs = len(batch_indices)
+
+        #     optimizer.zero_grad()
+
+        #     for idx in batch_indices:
+        #         traj1, traj2 = trajectory_pairs_tensors[idx]
+        #         preference = preferences[idx]
+
+        #         # Convert trajectories to tensors directly on device
+        #         states1, actions1, next_states1 = traj1
+        #         states2, actions2, next_states2 = traj2
+
+        #         # Compute predicted returns (with gradients enabled)
+        #         # Get rewards for all transitions
+        #         rewards1 = model.forward(states1, actions1, next_states1).squeeze(-1)
+        #         rewards2 = model.forward(states2, actions2, next_states2).squeeze(-1)
+
+        #         discounts1 = self.discount_cache[len(rewards1)]
+        #         discounts2 = self.discount_cache[len(rewards2)]
+
+        #         return1 = torch.sum(rewards1 * discounts1)
+        #         return2 = torch.sum(rewards2 * discounts2)
+
+        #         # Bradley-Terry preference model loss
+        #         # P(traj1 > traj2) = exp(return1) / (exp(return1) + exp(return2))
+        #         # If preference = 0, we want return1 > return2
+        #         # If preference = 1, we want return2 > return1
+
+        #         logits = torch.stack([return1, return2])
+        #         target = torch.tensor([preference], dtype=torch.long, device=self.device)
+
+        #         loss = nn.CrossEntropyLoss()(logits.unsqueeze(0), target)
+        #         batch_loss += loss.item()
+
+        #         # Accumulate gradients
+        #         loss.backward()
+
+        #     # Update parameters after processing all pairs in batch
+        #     optimizer.step()
+
+        #     losses.append(batch_loss / num_pairs)
 
         return losses
 
@@ -156,6 +201,7 @@ class RewardModelEnsemble:
             verbose: If True, print training progress.
         """
         num_pairs = len(trajectory_pairs)
+        trajectory_pairs_tensors = preprocess_trajectory_pairs(trajectory_pairs, self.state_dim, self.device)
 
         for epoch in range(num_epochs):
             # Generate indices for this epoch
@@ -175,10 +221,7 @@ class RewardModelEnsemble:
 
             if batch_size is None:
                 # Full batch training
-                for model_idx in range(self.ensemble_size):
-                    batch_indices = indices_per_model[model_idx]
-                    losses = self.train_step(trajectory_pairs, preferences, batch_indices)
-                    epoch_losses.append(losses[model_idx] if len(losses) > model_idx else losses[0])
+                epoch_losses = self.train_step(trajectory_pairs_tensors, preferences, indices_per_model)
             else:
                 # Mini-batch training
                 num_batches = (num_pairs + batch_size - 1) // batch_size
@@ -187,15 +230,15 @@ class RewardModelEnsemble:
                 for batch_idx in range(num_batches):
                     start_idx = batch_idx * batch_size
                     end_idx = min((batch_idx + 1) * batch_size, num_pairs)
+                    batch_indices_per_model = [indices_per_model[m][start_idx:end_idx] for m in range(self.ensemble_size)]
 
-                    for model_idx in range(self.ensemble_size):
-                        batch_indices = indices_per_model[model_idx][start_idx:end_idx]
-                        losses = self.train_step(trajectory_pairs, preferences, batch_indices)
-                        model_losses[model_idx].append(losses[model_idx] if len(losses) > model_idx else losses[0])
+                    losses = self.train_step(trajectory_pairs_tensors, preferences, batch_indices_per_model)
+                    for model_idx, loss in enumerate(losses):
+                        model_losses[model_idx].append(loss)
 
                 epoch_losses = [np.mean(losses) for losses in model_losses]
 
-            if verbose and (epoch % 10 == 0 or epoch == num_epochs - 1):
+            if verbose and (epoch % 1 == 0 or epoch == num_epochs - 1):
                 mean_loss = np.mean(epoch_losses)
                 print(f"Epoch {epoch + 1}/{num_epochs}, Mean Loss: {mean_loss:.4f}")
 

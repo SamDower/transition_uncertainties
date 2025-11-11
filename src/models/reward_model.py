@@ -190,3 +190,11 @@ def trajectory_to_tensors(
     next_states_tensor = torch.stack(next_states)
 
     return states_tensor, actions_tensor, next_states_tensor
+
+def preprocess_trajectory_pairs(trajectory_pairs, state_dim, device):
+    processed_pairs = []
+    for traj1, traj2 in trajectory_pairs:
+        traj1_tensors = trajectory_to_tensors(traj1, state_dim, device)
+        traj2_tensors = trajectory_to_tensors(traj2, state_dim, device)
+        processed_pairs.append((traj1_tensors, traj2_tensors))
+    return processed_pairs
