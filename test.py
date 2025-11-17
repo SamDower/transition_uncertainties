@@ -2,10 +2,10 @@
 
 import numpy as np
 import torch
-from src.environments import GridWorldMDP, SparseSummitMDP 
+from src.environments import GridWorldMDP, SparseSummitMDP
 from src.policies import UniformPolicy, CustomPolicy
 from src.utils import sample_trajectory_pairs, label_trajectory_pairs, get_trajectory_statistics
-from src.models import RewardModelEnsemble
+from src.models import RewardModelEnsemble, CanonicalizedRewardEnsemble, ValueAdjustedLevelling, L1Norm
 from src.utils.plotting import plot_ensemble_gridworld_deterministic
 import random
 
@@ -103,7 +103,25 @@ def main():
     print(f"   - Ensemble size: {ensemble_size}")
     print(f"   - State dimension: {state_dim}")
 
-    plot_ensemble_gridworld_deterministic(env, ensemble)
+    # Step 3: Create and canonicalize the ensemble
+    print("\n3. Creating canonicalized ensemble...")
+    canon_ensemble = CanonicalizedRewardEnsemble(
+        ensemble=ensemble,
+        canonicalizer=ValueAdjustedLevelling(discount_factor=0.99),
+        normalizer=L1Norm(),
+        mdp=env,
+        state_dim=state_dim,
+        device=device.type
+    )
+
+    print("   - Canonicalizing all models...")
+    canon_ensemble.canonicalize(verbose=True)
+    print(f"   - Canonicalization complete!")
+
+    # Step 4: Visualize both ensembles
+    print("\n4. Generating visualization...")
+    plot_ensemble_gridworld_deterministic(env, ensemble, canonicalized_ensemble=canon_ensemble)
+    print(f"   - Plot saved to figures/heatmaps.png")
 
 #     # Step 2: Create policy
 #     print("\n2. Creating policy...")

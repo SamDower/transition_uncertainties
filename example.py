@@ -30,7 +30,7 @@ def main():
 
     # Step 2: Create policy
     print("\n2. Creating policy...")
-    policy = CustomPolicy(lambda s: [0.2, 0.3, 0.2, 0.3])
+    policy = CustomPolicy(lambda s: [0.22, 0.28, 0.22, 0.28])
     print("   - Using uniform random policy")
 
     # Step 3: Sample trajectory pairs
@@ -91,9 +91,9 @@ def main():
     ensemble.train(
         trajectory_pairs=pairs,
         preferences=preferences,
-        num_epochs=20,
+        num_epochs=30,
         batch_size=10,
-        bootstrap=True,
+        bootstrap=False,
         verbose=True
     )
 
