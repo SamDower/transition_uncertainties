@@ -18,6 +18,51 @@ from typing import Callable, Any, Optional, Dict
 from .reward_model import TransitionRewardModel
 
 
+class MeanRewardModel(nn.Module):
+    """Wrapper for the mean reward model from an ensemble."""
+
+    def __init__(self, ensemble_models, device: str = 'cpu'):
+        """
+        Initialize mean reward model.
+
+        Args:
+            ensemble_models: List of models in the ensemble.
+            device: Device to run on.
+        """
+        super().__init__()
+        self.ensemble_models = ensemble_models
+        self.device = device
+
+    def forward(
+        self,
+        states: torch.Tensor,
+        actions: torch.Tensor,
+        next_states: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute mean reward predictions across ensemble.
+
+        Args:
+            states: Batch of states [batch_size, state_dim].
+            actions: Batch of actions [batch_size].
+            next_states: Batch of next states [batch_size, state_dim].
+
+        Returns:
+            Mean rewards [batch_size, 1].
+        """
+        rewards = []
+        for model in self.ensemble_models:
+            model.eval()
+            with torch.no_grad():
+                reward = model(states, actions, next_states)
+                rewards.append(reward)
+
+        # Stack and compute mean
+        rewards_stacked = torch.stack(rewards, dim=0)
+        mean_reward = torch.mean(rewards_stacked, dim=0)
+        return mean_reward
+
+
 class Canonicalizer(ABC):
     """Base class for canonicalization functions."""
 
@@ -75,6 +120,7 @@ class ValueAdjustedLevelling(Canonicalizer):
         Precompute rewards for all state-action-next_state transitions.
 
         This creates a lookup table for fast reward lookups during value iteration.
+        Works with both deterministic and stochastic MDPs.
 
         Args:
             reward_model: The reward model to precompute.
@@ -87,21 +133,12 @@ class ValueAdjustedLevelling(Canonicalizer):
         """
         precomputed_rewards = {}
 
-        # Get all states
-        if hasattr(mdp, 'grid_size'):
-            size = mdp.grid_size
-            all_states = [(x, y) for x in range(size) for y in range(size)]
-        else:
-            raise ValueError("MDP must have a 'grid_size' attribute")
+        # Check if MDP has get_all_transitions (stochastic) or enumerate states manually (deterministic)
+        if hasattr(mdp, 'get_all_transitions'):
+            # Stochastic MDP: use all possible transitions
+            all_transitions = mdp.get_all_transitions()
 
-        num_states = len(all_states)
-        num_actions = mdp.get_num_actions()
-
-        for state in all_states:
-            for action in range(num_actions):
-                # Take action in environment
-                next_state, _, _ = mdp.step(state, action)
-
+            for state, action, next_state, prob in all_transitions:
                 # Convert states to tensors
                 state_row, state_col = state
                 state_onehot = np.zeros(state_dim)
@@ -120,6 +157,40 @@ class ValueAdjustedLevelling(Canonicalizer):
                 with torch.no_grad():
                     reward_pred = reward_model(state_tensor, action_tensor, next_state_tensor)
                     precomputed_rewards[(state, action, next_state)] = reward_pred.item()
+        else:
+            # Deterministic MDP: original logic
+            if hasattr(mdp, 'grid_size'):
+                size = mdp.grid_size
+                all_states = [(x, y) for x in range(size) for y in range(size)]
+            else:
+                raise ValueError("MDP must have a 'grid_size' attribute")
+
+            num_states = len(all_states)
+            num_actions = mdp.get_num_actions()
+
+            for state in all_states:
+                for action in range(num_actions):
+                    # Take action in environment
+                    next_state, _, _ = mdp.step(state, action)
+
+                    # Convert states to tensors
+                    state_row, state_col = state
+                    state_onehot = np.zeros(state_dim)
+                    state_onehot[state_row * int(np.sqrt(state_dim)) + state_col] = 1.0
+
+                    next_state_row, next_state_col = next_state
+                    next_state_onehot = np.zeros(state_dim)
+                    next_state_onehot[next_state_row * int(np.sqrt(state_dim)) + next_state_col] = 1.0
+
+                    state_tensor = torch.FloatTensor(state_onehot).unsqueeze(0).to(device)
+                    next_state_tensor = torch.FloatTensor(next_state_onehot).unsqueeze(0).to(device)
+                    action_tensor = torch.LongTensor([action]).to(device)
+
+                    # Get reward from model
+                    reward_model.eval()
+                    with torch.no_grad():
+                        reward_pred = reward_model(state_tensor, action_tensor, next_state_tensor)
+                        precomputed_rewards[(state, action, next_state)] = reward_pred.item()
 
         return precomputed_rewards
 
@@ -276,22 +347,19 @@ class L1Norm(Normalizer):
         device: str = 'cpu'
     ):
         """
-        Fit L1 norm constant over all state-action pairs.
+        Fit L1 norm constant over all state-action-next_state pairs.
 
-        Computes: beta = Σ_s Σ_a |c(R)(s,a,s')|
+        For stochastic MDPs: beta = Σ_s Σ_a Σ_s' P(s'|s,a) |c(R)(s,a,s')|
+        For deterministic MDPs: beta = Σ_s Σ_a |c(R)(s,a,s')|
         """
-        if hasattr(mdp, 'grid_size'):
-            size = mdp.grid_size
-            all_states = [(x, y) for x in range(size) for y in range(size)]
-        else:
-            raise ValueError("MDP must have a 'grid_size' attribute")
-
         l1_sum = 0.0
 
-        for state in all_states:
-            for action in range(mdp.get_num_actions()):
-                next_state, _, _ = mdp.step(state, action)
+        # Check if MDP has get_all_transitions (stochastic)
+        if hasattr(mdp, 'get_all_transitions'):
+            # Stochastic MDP: iterate over all possible transitions
+            all_transitions = mdp.get_all_transitions()
 
+            for state, action, next_state, prob in all_transitions:
                 # Convert to tensors for canonicalize_fn
                 state_row, state_col = state
                 state_onehot = np.zeros(state_dim)
@@ -306,7 +374,35 @@ class L1Norm(Normalizer):
                 action_tensor = torch.LongTensor([action]).to(device)
 
                 reward = canonicalize_fn(state_tensor, action_tensor, next_state_tensor)
-                l1_sum += abs(reward.item())
+                # Include probability weighting for stochastic transitions
+                l1_sum += prob * abs(reward.item())
+        else:
+            # Deterministic MDP: original logic
+            if hasattr(mdp, 'grid_size'):
+                size = mdp.grid_size
+                all_states = [(x, y) for x in range(size) for y in range(size)]
+            else:
+                raise ValueError("MDP must have a 'grid_size' attribute")
+
+            for state in all_states:
+                for action in range(mdp.get_num_actions()):
+                    next_state, _, _ = mdp.step(state, action)
+
+                    # Convert to tensors for canonicalize_fn
+                    state_row, state_col = state
+                    state_onehot = np.zeros(state_dim)
+                    state_onehot[state_row * int(np.sqrt(state_dim)) + state_col] = 1.0
+
+                    next_state_row, next_state_col = next_state
+                    next_state_onehot = np.zeros(state_dim)
+                    next_state_onehot[next_state_row * int(np.sqrt(state_dim)) + next_state_col] = 1.0
+
+                    state_tensor = torch.FloatTensor(state_onehot).unsqueeze(0).to(device)
+                    next_state_tensor = torch.FloatTensor(next_state_onehot).unsqueeze(0).to(device)
+                    action_tensor = torch.LongTensor([action]).to(device)
+
+                    reward = canonicalize_fn(state_tensor, action_tensor, next_state_tensor)
+                    l1_sum += abs(reward.item())
 
         self.normalization_constant = l1_sum if l1_sum > 0 else 1e-8
         self.is_fitted = True
@@ -337,22 +433,19 @@ class L2Norm(Normalizer):
         device: str = 'cpu'
     ):
         """
-        Fit L2 norm constant over all state-action pairs.
+        Fit L2 norm constant over all state-action-next_state pairs.
 
-        Computes: beta = sqrt(Σ_s Σ_a (c(R)(s,a,s'))^2)
+        For stochastic MDPs: beta = sqrt(Σ_s Σ_a Σ_s' P(s'|s,a) (c(R)(s,a,s'))^2)
+        For deterministic MDPs: beta = sqrt(Σ_s Σ_a (c(R)(s,a,s'))^2)
         """
-        if hasattr(mdp, 'grid_size'):
-            size = mdp.grid_size
-            all_states = [(x, y) for x in range(size) for y in range(size)]
-        else:
-            raise ValueError("MDP must have a 'grid_size' attribute")
-
         l2_sum = 0.0
 
-        for state in all_states:
-            for action in range(mdp.get_num_actions()):
-                next_state, _, _ = mdp.step(state, action)
+        # Check if MDP has get_all_transitions (stochastic)
+        if hasattr(mdp, 'get_all_transitions'):
+            # Stochastic MDP: iterate over all possible transitions
+            all_transitions = mdp.get_all_transitions()
 
+            for state, action, next_state, prob in all_transitions:
                 # Convert to tensors for canonicalize_fn
                 state_row, state_col = state
                 state_onehot = np.zeros(state_dim)
@@ -367,7 +460,35 @@ class L2Norm(Normalizer):
                 action_tensor = torch.LongTensor([action]).to(device)
 
                 reward = canonicalize_fn(state_tensor, action_tensor, next_state_tensor)
-                l2_sum += reward.item() ** 2
+                # Include probability weighting for stochastic transitions
+                l2_sum += prob * (reward.item() ** 2)
+        else:
+            # Deterministic MDP: original logic
+            if hasattr(mdp, 'grid_size'):
+                size = mdp.grid_size
+                all_states = [(x, y) for x in range(size) for y in range(size)]
+            else:
+                raise ValueError("MDP must have a 'grid_size' attribute")
+
+            for state in all_states:
+                for action in range(mdp.get_num_actions()):
+                    next_state, _, _ = mdp.step(state, action)
+
+                    # Convert to tensors for canonicalize_fn
+                    state_row, state_col = state
+                    state_onehot = np.zeros(state_dim)
+                    state_onehot[state_row * int(np.sqrt(state_dim)) + state_col] = 1.0
+
+                    next_state_row, next_state_col = next_state
+                    next_state_onehot = np.zeros(state_dim)
+                    next_state_onehot[next_state_row * int(np.sqrt(state_dim)) + next_state_col] = 1.0
+
+                    state_tensor = torch.FloatTensor(state_onehot).unsqueeze(0).to(device)
+                    next_state_tensor = torch.FloatTensor(next_state_onehot).unsqueeze(0).to(device)
+                    action_tensor = torch.LongTensor([action]).to(device)
+
+                    reward = canonicalize_fn(state_tensor, action_tensor, next_state_tensor)
+                    l2_sum += reward.item() ** 2
 
         self.normalization_constant = np.sqrt(l2_sum) if l2_sum > 0 else 1e-8
         self.is_fitted = True
@@ -398,22 +519,19 @@ class MaxNorm(Normalizer):
         device: str = 'cpu'
     ):
         """
-        Fit max norm constant over all state-action pairs.
+        Fit max norm constant over all state-action-next_state pairs.
 
-        Computes: beta = max_s max_a |c(R)(s,a,s')|
+        For stochastic MDPs: beta = max_s max_a max_s' |c(R)(s,a,s')|
+        For deterministic MDPs: beta = max_s max_a |c(R)(s,a,s')|
         """
-        if hasattr(mdp, 'grid_size'):
-            size = mdp.grid_size
-            all_states = [(x, y) for x in range(size) for y in range(size)]
-        else:
-            raise ValueError("MDP must have a 'grid_size' attribute")
-
         max_val = 0.0
 
-        for state in all_states:
-            for action in range(mdp.get_num_actions()):
-                next_state, _, _ = mdp.step(state, action)
+        # Check if MDP has get_all_transitions (stochastic)
+        if hasattr(mdp, 'get_all_transitions'):
+            # Stochastic MDP: iterate over all possible transitions
+            all_transitions = mdp.get_all_transitions()
 
+            for state, action, next_state, prob in all_transitions:
                 # Convert to tensors for canonicalize_fn
                 state_row, state_col = state
                 state_onehot = np.zeros(state_dim)
@@ -429,6 +547,33 @@ class MaxNorm(Normalizer):
 
                 reward = canonicalize_fn(state_tensor, action_tensor, next_state_tensor)
                 max_val = max(max_val, abs(reward.item()))
+        else:
+            # Deterministic MDP: original logic
+            if hasattr(mdp, 'grid_size'):
+                size = mdp.grid_size
+                all_states = [(x, y) for x in range(size) for y in range(size)]
+            else:
+                raise ValueError("MDP must have a 'grid_size' attribute")
+
+            for state in all_states:
+                for action in range(mdp.get_num_actions()):
+                    next_state, _, _ = mdp.step(state, action)
+
+                    # Convert to tensors for canonicalize_fn
+                    state_row, state_col = state
+                    state_onehot = np.zeros(state_dim)
+                    state_onehot[state_row * int(np.sqrt(state_dim)) + state_col] = 1.0
+
+                    next_state_row, next_state_col = next_state
+                    next_state_onehot = np.zeros(state_dim)
+                    next_state_onehot[next_state_row * int(np.sqrt(state_dim)) + next_state_col] = 1.0
+
+                    state_tensor = torch.FloatTensor(state_onehot).unsqueeze(0).to(device)
+                    next_state_tensor = torch.FloatTensor(next_state_onehot).unsqueeze(0).to(device)
+                    action_tensor = torch.LongTensor([action]).to(device)
+
+                    reward = canonicalize_fn(state_tensor, action_tensor, next_state_tensor)
+                    max_val = max(max_val, abs(reward.item()))
 
         self.normalization_constant = max_val if max_val > 0 else 1e-8
         self.is_fitted = True
@@ -459,7 +604,8 @@ class CanonicalizedRewardModel(nn.Module):
         normalizer: Normalizer,
         mdp: Any,
         state_dim: int,
-        device: str = 'cpu'
+        device: str = 'cpu',
+        rescaling_constant: float = 1.0
     ):
         """
         Initialize canonicalized reward model.
@@ -471,6 +617,7 @@ class CanonicalizedRewardModel(nn.Module):
             mdp: The MDP environment.
             state_dim: Dimension of state representation.
             device: Device to run on.
+            rescaling_constant: Constant to rescale normalized rewards. Defaults to 1.0 (no rescaling).
         """
         super().__init__()
 
@@ -480,6 +627,7 @@ class CanonicalizedRewardModel(nn.Module):
         self.mdp = mdp
         self.state_dim = state_dim
         self.device = device
+        self.rescaling_constant = rescaling_constant
 
         # Precompute canonicalization function
         self.canonicalize_fn = canonicalizer.canonicalize(
@@ -513,7 +661,10 @@ class CanonicalizedRewardModel(nn.Module):
         # Apply normalization
         normalized = self.normalizer.normalize(canonicalized)
 
-        return normalized
+        # Apply rescaling
+        rescaled = normalized * self.rescaling_constant
+
+        return rescaled
 
 
 class CanonicalizedRewardEnsemble:
@@ -555,6 +706,202 @@ class CanonicalizedRewardEnsemble:
 
         self.canonicalized_models = []
         self.is_canonicalized = False
+        self.rescaling_constant = 1.0
+
+    def _compute_mean_reward_model(self):
+        """
+        Create a mean reward model from the ensemble.
+
+        Returns:
+            A MeanRewardModel instance that computes mean rewards across the ensemble.
+        """
+        mean_model = MeanRewardModel(self.ensemble.models, device=self.device)
+        return mean_model
+
+    def _compute_rescaling_constant(self) -> float:
+        """
+        Compute rescaling constant based on the norm of the mean reward model.
+
+        Uses the same norm type as the normalizer to ensure consistency.
+        The constant is computed after canonicalization but before the normalization step.
+
+        Returns:
+            Rescaling constant C.
+        """
+        print("  - Computing rescaling constant from mean reward model...")
+
+        # Get mean reward model
+        mean_reward_fn = self._compute_mean_reward_model()
+
+        # Canonicalize the mean reward model
+        canonicalize_fn = self.canonicalizer.canonicalize(
+            mean_reward_fn, self.mdp, self.state_dim, self.device
+        )
+
+        # Compute norm of canonicalized mean rewards using same norm type as normalizer
+        if hasattr(self.mdp, 'grid_size'):
+            size = self.mdp.grid_size
+            all_states = [(x, y) for x in range(size) for y in range(size)]
+        else:
+            raise ValueError("MDP must have a 'grid_size' attribute")
+
+        if isinstance(self.normalizer, L1Norm):
+            norm_value = self._compute_l1_norm(canonicalize_fn, all_states)
+        elif isinstance(self.normalizer, L2Norm):
+            norm_value = self._compute_l2_norm(canonicalize_fn, all_states)
+        elif isinstance(self.normalizer, MaxNorm):
+            norm_value = self._compute_max_norm(canonicalize_fn, all_states)
+        else:
+            raise ValueError(f"Unknown normalizer type: {type(self.normalizer)}")
+
+        rescaling_constant = norm_value if norm_value > 0 else 1.0
+        print(f"    Rescaling constant: {rescaling_constant:.6f}")
+
+        return rescaling_constant
+
+    def _compute_l1_norm(self, canonicalize_fn, all_states) -> float:
+        """Compute L1 norm of canonicalized rewards."""
+        l1_sum = 0.0
+
+        # Check if MDP has get_all_transitions (stochastic)
+        if hasattr(self.mdp, 'get_all_transitions'):
+            # Stochastic MDP: iterate over all transitions
+            all_transitions = self.mdp.get_all_transitions()
+            for state, action, next_state, prob in all_transitions:
+                # Convert to tensors
+                state_row, state_col = state
+                state_onehot = np.zeros(self.state_dim)
+                state_onehot[state_row * int(np.sqrt(self.state_dim)) + state_col] = 1.0
+
+                next_state_row, next_state_col = next_state
+                next_state_onehot = np.zeros(self.state_dim)
+                next_state_onehot[next_state_row * int(np.sqrt(self.state_dim)) + next_state_col] = 1.0
+
+                state_tensor = torch.FloatTensor(state_onehot).unsqueeze(0).to(self.device)
+                next_state_tensor = torch.FloatTensor(next_state_onehot).unsqueeze(0).to(self.device)
+                action_tensor = torch.LongTensor([action]).to(self.device)
+
+                reward = canonicalize_fn(state_tensor, action_tensor, next_state_tensor)
+                l1_sum += prob * abs(reward.item())
+        else:
+            # Deterministic MDP: original logic
+            for state in all_states:
+                for action in range(self.mdp.get_num_actions()):
+                    next_state, _, _ = self.mdp.step(state, action)
+
+                    # Convert to tensors
+                    state_row, state_col = state
+                    state_onehot = np.zeros(self.state_dim)
+                    state_onehot[state_row * int(np.sqrt(self.state_dim)) + state_col] = 1.0
+
+                    next_state_row, next_state_col = next_state
+                    next_state_onehot = np.zeros(self.state_dim)
+                    next_state_onehot[next_state_row * int(np.sqrt(self.state_dim)) + next_state_col] = 1.0
+
+                    state_tensor = torch.FloatTensor(state_onehot).unsqueeze(0).to(self.device)
+                    next_state_tensor = torch.FloatTensor(next_state_onehot).unsqueeze(0).to(self.device)
+                    action_tensor = torch.LongTensor([action]).to(self.device)
+
+                    reward = canonicalize_fn(state_tensor, action_tensor, next_state_tensor)
+                    l1_sum += abs(reward.item())
+
+        return l1_sum
+
+    def _compute_l2_norm(self, canonicalize_fn, all_states) -> float:
+        """Compute L2 norm of canonicalized rewards."""
+        l2_sum = 0.0
+
+        # Check if MDP has get_all_transitions (stochastic)
+        if hasattr(self.mdp, 'get_all_transitions'):
+            # Stochastic MDP: iterate over all transitions
+            all_transitions = self.mdp.get_all_transitions()
+            for state, action, next_state, prob in all_transitions:
+                # Convert to tensors
+                state_row, state_col = state
+                state_onehot = np.zeros(self.state_dim)
+                state_onehot[state_row * int(np.sqrt(self.state_dim)) + state_col] = 1.0
+
+                next_state_row, next_state_col = next_state
+                next_state_onehot = np.zeros(self.state_dim)
+                next_state_onehot[next_state_row * int(np.sqrt(self.state_dim)) + next_state_col] = 1.0
+
+                state_tensor = torch.FloatTensor(state_onehot).unsqueeze(0).to(self.device)
+                next_state_tensor = torch.FloatTensor(next_state_onehot).unsqueeze(0).to(self.device)
+                action_tensor = torch.LongTensor([action]).to(self.device)
+
+                reward = canonicalize_fn(state_tensor, action_tensor, next_state_tensor)
+                l2_sum += prob * (reward.item() ** 2)
+        else:
+            # Deterministic MDP: original logic
+            for state in all_states:
+                for action in range(self.mdp.get_num_actions()):
+                    next_state, _, _ = self.mdp.step(state, action)
+
+                    # Convert to tensors
+                    state_row, state_col = state
+                    state_onehot = np.zeros(self.state_dim)
+                    state_onehot[state_row * int(np.sqrt(self.state_dim)) + state_col] = 1.0
+
+                    next_state_row, next_state_col = next_state
+                    next_state_onehot = np.zeros(self.state_dim)
+                    next_state_onehot[next_state_row * int(np.sqrt(self.state_dim)) + next_state_col] = 1.0
+
+                    state_tensor = torch.FloatTensor(state_onehot).unsqueeze(0).to(self.device)
+                    next_state_tensor = torch.FloatTensor(next_state_onehot).unsqueeze(0).to(self.device)
+                    action_tensor = torch.LongTensor([action]).to(self.device)
+
+                    reward = canonicalize_fn(state_tensor, action_tensor, next_state_tensor)
+                    l2_sum += reward.item() ** 2
+
+        return np.sqrt(l2_sum)
+
+    def _compute_max_norm(self, canonicalize_fn, all_states) -> float:
+        """Compute max norm of canonicalized rewards."""
+        max_val = 0.0
+
+        # Check if MDP has get_all_transitions (stochastic)
+        if hasattr(self.mdp, 'get_all_transitions'):
+            # Stochastic MDP: iterate over all transitions
+            all_transitions = self.mdp.get_all_transitions()
+            for state, action, next_state, prob in all_transitions:
+                # Convert to tensors
+                state_row, state_col = state
+                state_onehot = np.zeros(self.state_dim)
+                state_onehot[state_row * int(np.sqrt(self.state_dim)) + state_col] = 1.0
+
+                next_state_row, next_state_col = next_state
+                next_state_onehot = np.zeros(self.state_dim)
+                next_state_onehot[next_state_row * int(np.sqrt(self.state_dim)) + next_state_col] = 1.0
+
+                state_tensor = torch.FloatTensor(state_onehot).unsqueeze(0).to(self.device)
+                next_state_tensor = torch.FloatTensor(next_state_onehot).unsqueeze(0).to(self.device)
+                action_tensor = torch.LongTensor([action]).to(self.device)
+
+                reward = canonicalize_fn(state_tensor, action_tensor, next_state_tensor)
+                max_val = max(max_val, abs(reward.item()))
+        else:
+            # Deterministic MDP: original logic
+            for state in all_states:
+                for action in range(self.mdp.get_num_actions()):
+                    next_state, _, _ = self.mdp.step(state, action)
+
+                    # Convert to tensors
+                    state_row, state_col = state
+                    state_onehot = np.zeros(self.state_dim)
+                    state_onehot[state_row * int(np.sqrt(self.state_dim)) + state_col] = 1.0
+
+                    next_state_row, next_state_col = next_state
+                    next_state_onehot = np.zeros(self.state_dim)
+                    next_state_onehot[next_state_row * int(np.sqrt(self.state_dim)) + next_state_col] = 1.0
+
+                    state_tensor = torch.FloatTensor(state_onehot).unsqueeze(0).to(self.device)
+                    next_state_tensor = torch.FloatTensor(next_state_onehot).unsqueeze(0).to(self.device)
+                    action_tensor = torch.LongTensor([action]).to(self.device)
+
+                    reward = canonicalize_fn(state_tensor, action_tensor, next_state_tensor)
+                    max_val = max(max_val, abs(reward.item()))
+
+        return max_val
 
     def canonicalize(self, verbose: bool = True):
         """
@@ -569,6 +916,11 @@ class CanonicalizedRewardEnsemble:
         if verbose:
             print(f"Canonicalizing {len(self.ensemble.models)} reward models...")
 
+        # Compute rescaling constant based on mean reward model
+        if verbose:
+            print("\nComputing rescaling constant...")
+        self.rescaling_constant = self._compute_rescaling_constant()
+
         self.canonicalized_models = []
 
         # Note: We create fresh normalizer instances for each ensemble canonicalization
@@ -578,7 +930,7 @@ class CanonicalizedRewardEnsemble:
 
         for idx, model in enumerate(self.ensemble.models):
             if verbose:
-                print(f"  Model {idx + 1}/{len(self.ensemble.models)}:")
+                print(f"\n  Model {idx + 1}/{len(self.ensemble.models)}:")
 
             # Create a fresh normalizer for this model
             # It will be fitted during CanonicalizedRewardModel initialization
@@ -591,7 +943,8 @@ class CanonicalizedRewardEnsemble:
                 normalizer=model_normalizer,
                 mdp=self.mdp,
                 state_dim=self.state_dim,
-                device=self.device
+                device=self.device,
+                rescaling_constant=self.rescaling_constant
             )
 
             self.canonicalized_models.append(canonicalized_model)
@@ -599,7 +952,7 @@ class CanonicalizedRewardEnsemble:
         self.is_canonicalized = True
 
         if verbose:
-            print(f"  Canonicalization complete!")
+            print(f"\n  Canonicalization complete!")
 
     def predict_returns(
         self,

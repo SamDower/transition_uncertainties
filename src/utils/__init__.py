@@ -8,6 +8,7 @@ from .reward_functions import (
     create_ensemble_pessimistic_reward_fn,
     create_true_reward_fn
 )
+from .ensemble_training import train_and_save_ensemble, load_ensemble, plot_ensemble, evaluate_ensemble
 
 __all__ = [
     'Trajectory',
@@ -20,5 +21,9 @@ __all__ = [
     'create_ensemble_mean_reward_fn',
     'create_ensemble_optimistic_reward_fn',
     'create_ensemble_pessimistic_reward_fn',
-    'create_true_reward_fn'
+    'create_true_reward_fn',
+    'train_and_save_ensemble',
+    'load_ensemble',
+    'plot_ensemble',
+    'evaluate_ensemble'
 ]

@@ -67,8 +67,7 @@ class ValueIteration:
         Uses the Bellman expectation equation:
         V(s) = Σ_a π(a|s) * Σ_{s'} P(s'|s,a) * [R(s,a,s') + γ * V(s')]
 
-        For deterministic environments:
-        V(s) = Σ_a π(a|s) * [R(s,a,s') + γ * V(s')]
+        Works with both deterministic and stochastic MDPs.
 
         Args:
             state: The state to compute value for.
@@ -81,14 +80,29 @@ class ValueIteration:
         state_value = 0.0
 
         for action in range(self.mdp.get_num_actions()):
-            # Take action in environment
-            next_state, _, _ = self.mdp.step(state, action)
+            action_value = 0.0
 
-            # Get reward for this transition
-            reward = self.reward_fn(state, action, next_state)
+            # Check if MDP has get_all_transitions (stochastic)
+            if hasattr(self.mdp, 'get_all_transitions'):
+                # Stochastic MDP: need to handle multiple next states
+                # Get all transitions for this state-action pair
+                all_transitions = self.mdp.get_all_transitions()
+                for s, a, next_state, prob in all_transitions:
+                    if s == state and a == action:
+                        # Get reward for this transition
+                        reward = self.reward_fn(state, action, next_state)
 
-            # Bellman update: V(s) = π(a|s) * [R(s,a,s') + γ * V(s')]
-            action_value = reward + self.discount_factor * self.get_value(next_state)
+                        # Bellman update: V(s) = π(a|s) * Σ_{s'} P(s'|s,a) * [R(s,a,s') + γ * V(s')]
+                        action_value += prob * (reward + self.discount_factor * self.get_value(next_state))
+            else:
+                # Deterministic MDP: original logic
+                next_state, _, _ = self.mdp.step(state, action)
+
+                # Get reward for this transition
+                reward = self.reward_fn(state, action, next_state)
+
+                # Bellman update: V(s) = π(a|s) * [R(s,a,s') + γ * V(s')]
+                action_value = reward + self.discount_factor * self.get_value(next_state)
 
             # Accumulate weighted by policy probability
             state_value += action_probs[action] * action_value
